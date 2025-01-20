@@ -1,0 +1,10 @@
+pub const IPV4_HEADER_LEN: usize = 20;
+pub const DEFAULT_PORT: u16 = 12345;
+pub const DEFAULT_TTL: u8 = 64;
+pub const MAX_PACKET_SIZE: usize = 65535;
+pub const DEFAULT_TIMEOUT: u64 = 10;
+pub const DEFAULT_RATE_LIMIT: u64 = 10;
+pub const DEFAULT_BURST_SIZE: usize = 0;
+pub const DEFAULT_DELAY: u64 = 0;
+pub const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+pub const DEFAULT_PAYLOAD: &str = "Hello, this is a spoofed packet!"; 

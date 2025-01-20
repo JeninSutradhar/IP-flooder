@@ -1,0 +1,21 @@
+[package]
+name = "ip_flooder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+colored = "2.0"
+log = "0.4"
+simplelog = "0.12"
+pcap = "1.1"
+pnet = "0.34"
+socket2 = { version = "0.5", features = ["all"] }
+rand = "0.8"
+libc = "0.2"
+nix = "0.26"
+ansi_term = "0.12"
+rayon = "1.8"
+num_cpus = "1.16"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
