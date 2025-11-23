@@ -19,7 +19,7 @@ impl fmt::Display for FlooderError {
             FlooderError::PermissionDenied => write!(f, "Permission denied. Please run with sudo"),
             FlooderError::InvalidProtocol(p) => write!(f, "Invalid protocol: {}", p),
             FlooderError::InvalidAddress(addr) => write!(f, "Invalid address: {}", addr),
-            FlooderError::PcapError(msg) => write!(f, "PCAP error: {}", msg),
+            FlooderError::PcapError(msg) => write!(f, "PCAP Error: {}", msg),
         }
     }
 }
